@@ -9,12 +9,19 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
+	"routes": [
+		"mail.h2seo4.win/*"
+	],
 	"vars": {
 		// Production deploys must also define POLICY_AUD and TEAM_DOMAIN.
 		// TEAM_DOMAIN may be the base Access URL or the full /cdn-cgi/access/certs URL.
 		// The worker now fails closed outside local development if Access is not configured.
-		"DOMAINS": "example.com",
-		"EMAIL_ADDRESSES": []
+		"DOMAINS": [
+			"h2seo4.win"
+		],
+		"EMAIL_ADDRESSES": ["1445355752@qq.com"],
+		"POLICY_AUD": "cc8655e2-959f-4be0-bf15-6705cc08194f",
+		"TEAM_DOMAIN": "https://h2seo4.cloudflareaccess.com/cdn-cgi/access/certs"
 	},
 	"send_email": [
 		{
