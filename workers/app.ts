@@ -4,7 +4,12 @@
 
 import { routeAgentRequest } from "agents";
 import { Hono } from "hono";
-import { jwtVerify, createRemoteJWKSet } from "jose";
+import {
+	createRemoteJWKSet,
+	decodeJwt,
+	decodeProtectedHeader,
+	jwtVerify,
+} from "jose";
 import { createRequestHandler } from "react-router";
 import { app as apiApp, receiveEmail } from "./index";
 import { EmailMCP } from "./mcp";
@@ -30,13 +35,24 @@ const requestHandler = createRequestHandler(
 
 function getAccessUrls(teamDomain: string) {
 	const certsPath = "/cdn-cgi/access/certs";
-	const teamUrl = new URL(teamDomain);
+	const normalizedTeamDomain = teamDomain.trim();
+	const teamUrl = new URL(
+		normalizedTeamDomain.includes("://")
+			? normalizedTeamDomain
+			: `https://${normalizedTeamDomain.includes(".")
+				? normalizedTeamDomain
+				: `${normalizedTeamDomain}.cloudflareaccess.com`}`,
+	);
 	const issuer = teamUrl.origin;
 	const certsUrl = teamUrl.pathname.endsWith(certsPath)
 		? teamUrl
 		: new URL(certsPath, issuer);
 
 	return { issuer, certsUrl };
+}
+
+function logAccessFailure(details: Record<string, unknown>) {
+	console.error("Cloudflare Access JWT validation failed", details);
 }
 
 // Main app that wraps the API and adds React Router fallback
@@ -61,7 +77,21 @@ app.use("*", async (c, next) => {
 
 	const token = c.req.header("cf-access-jwt-assertion");
 	if (!token) {
+		logAccessFailure({ reason: "missing-token" });
 		return c.text("Missing required CF Access JWT", 403);
+	}
+
+	let decodedClaims: Record<string, unknown> | undefined;
+	let decodedHeader: Record<string, unknown> | undefined;
+	try {
+		decodedClaims = decodeJwt(token);
+		decodedHeader = decodeProtectedHeader(token);
+	} catch (error) {
+		logAccessFailure({
+			reason: "malformed-token",
+			message: error instanceof Error ? error.message : String(error),
+		});
+		return c.text("Invalid or expired Access token", 403);
 	}
 
 	try {
@@ -70,8 +100,26 @@ app.use("*", async (c, next) => {
 		await jwtVerify(token, JWKS, {
 			issuer,
 			audience: POLICY_AUD,
+			clockTolerance: 60,
 		});
-	} catch {
+	} catch (error) {
+		const { issuer, certsUrl } = getAccessUrls(TEAM_DOMAIN);
+		logAccessFailure({
+			reason: error instanceof Error ? error.name : "verification-error",
+			message: error instanceof Error ? error.message : String(error),
+			code: error && typeof error === "object" && "code" in error ? (error as { code?: string }).code : undefined,
+			issuer,
+			certsUrl: certsUrl.toString(),
+			policyAud: POLICY_AUD,
+			tokenHeader: decodedHeader,
+			tokenClaims: {
+				iss: decodedClaims.iss,
+				aud: decodedClaims.aud,
+				exp: decodedClaims.exp,
+				nbf: decodedClaims.nbf,
+				iat: decodedClaims.iat,
+			},
+		});
 		return c.text("Invalid or expired Access token", 403);
 	}
 

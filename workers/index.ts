@@ -63,6 +63,74 @@ function boolQuery(c: AppContext, key: string): boolean | undefined {
 	return v === "true" || v === "1";
 }
 
+function normalizeEmailAddresses(rawValue: unknown): string[] {
+	const asArray = (() => {
+		if (Array.isArray(rawValue)) {
+			return rawValue;
+		}
+
+		if (typeof rawValue === "string") {
+			const trimmed = rawValue.trim();
+			if (!trimmed) return [];
+
+			if (trimmed.startsWith("[")) {
+				try {
+					const parsed = JSON.parse(trimmed);
+					if (Array.isArray(parsed)) return parsed;
+				} catch {
+					// Fall back to comma-separated / single-value parsing below.
+				}
+			}
+
+			return trimmed.includes(",") ? trimmed.split(",") : [trimmed];
+		}
+
+		if (rawValue === undefined || rawValue === null) {
+			return [];
+		}
+
+		return [rawValue];
+	})();
+
+	const seen = new Set<string>();
+	const normalized: string[] = [];
+
+	for (const value of asArray) {
+		const email = String(value).trim();
+		if (!email) continue;
+		const key = email.toLowerCase();
+		if (seen.has(key)) continue;
+		seen.add(key);
+		normalized.push(email);
+	}
+
+	return normalized;
+}
+
+const DEFAULT_MAILBOX_SETTINGS = {
+	fromName: "",
+	forwarding: { enabled: false, email: "" },
+	signature: { enabled: false, text: "" },
+	autoReply: { enabled: false, subject: "", message: "" },
+};
+
+async function ensureMailboxExists(
+	env: Env,
+	mailboxId: string,
+	name = mailboxId,
+) {
+	const key = `mailboxes/${mailboxId}.json`;
+	if (await env.BUCKET.head(key)) {
+		return false;
+	}
+
+	const finalSettings = { ...DEFAULT_MAILBOX_SETTINGS, fromName: name };
+	await env.BUCKET.put(key, JSON.stringify(finalSettings));
+	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
+	await stub.getFolders();
+	return true;
+}
+
 // -- App & middleware -----------------------------------------------
 
 const app = new Hono<MailboxContext>();
@@ -87,8 +155,8 @@ app.use("/api/v1/mailboxes/:mailboxId/*", requireMailbox);
 
 app.get("/api/v1/config", (c) => {
 	const domainsRaw = c.env.DOMAINS || "";
-	const domains = domainsRaw.split(",").map((d) => d.trim()).filter(Boolean);
-	const emailAddresses = c.env.EMAIL_ADDRESSES ?? [];
+	const domains = normalizeEmailAddresses(domainsRaw);
+	const emailAddresses = normalizeEmailAddresses(c.env.EMAIL_ADDRESSES);
 	return c.json({ domains, emailAddresses });
 });
 
@@ -102,14 +170,13 @@ app.get("/api/v1/mailboxes", async (c) => {
 app.post("/api/v1/mailboxes", async (c) => {
 	const { name, settings, email: rawEmail } = CreateMailboxBody.parse(await c.req.json());
 	const email = rawEmail.toLowerCase();
-	const allowedAddresses = (c.env.EMAIL_ADDRESSES ?? []) as string[];
+	const allowedAddresses = normalizeEmailAddresses(c.env.EMAIL_ADDRESSES);
 	if (allowedAddresses.length > 0 && !allowedAddresses.map((a) => a.toLowerCase()).includes(email)) {
 		return c.json({ error: "Mailbox creation is restricted to configured EMAIL_ADDRESSES" }, 403);
 	}
 	const key = `mailboxes/${email}.json`;
 	if (await c.env.BUCKET.head(key)) return c.json({ error: "Mailbox already exists" }, 409);
-	const defaultSettings = { fromName: name, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" } };
-	const finalSettings = { ...defaultSettings, ...settings };
+	const finalSettings = { ...DEFAULT_MAILBOX_SETTINGS, fromName: name, ...settings };
 	await c.env.BUCKET.put(key, JSON.stringify(finalSettings));
 	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(email));
 	await stub.getFolders();
@@ -351,7 +418,7 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 
 	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) throw new Error("received email with empty to");
 
-	const allowedAddresses = ((env.EMAIL_ADDRESSES ?? []) as string[]).map((a) => a.toLowerCase());
+	const allowedAddresses = normalizeEmailAddresses(env.EMAIL_ADDRESSES).map((a) => a.toLowerCase());
 	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
 	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
@@ -364,7 +431,10 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 	if (!mailboxId) throw new Error("received email with no valid recipient address");
 
 	const messageId = crypto.randomUUID();
-	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return; }
+	const mailboxCreated = await ensureMailboxExists(env, mailboxId);
+	if (mailboxCreated) {
+		console.log(`Auto-created mailbox for inbound email: ${mailboxId}`);
+	}
 
 	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
 
