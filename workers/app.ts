@@ -4,15 +4,11 @@
 
 import { routeAgentRequest } from "agents";
 import { Hono } from "hono";
-import {
-	createRemoteJWKSet,
-	decodeJwt,
-	decodeProtectedHeader,
-	jwtVerify,
-} from "jose";
 import { createRequestHandler } from "react-router";
 import { app as apiApp, receiveEmail } from "./index";
 import { EmailMCP } from "./mcp";
+import { handleGitHubLogin, handleGitHubCallback, optionalAuth } from "./auth";
+import { getCookie, setCookie } from "hono/cookie";
 import type { Env } from "./types";
 
 export { MailboxDO } from "./durableObject";
@@ -33,99 +29,33 @@ const requestHandler = createRequestHandler(
 	import.meta.env.MODE,
 );
 
-function getAccessUrls(teamDomain: string) {
-	const certsPath = "/cdn-cgi/access/certs";
-	const normalizedTeamDomain = teamDomain.trim();
-	const teamUrl = new URL(
-		normalizedTeamDomain.includes("://")
-			? normalizedTeamDomain
-			: `https://${normalizedTeamDomain.includes(".")
-				? normalizedTeamDomain
-				: `${normalizedTeamDomain}.cloudflareaccess.com`}`,
-	);
-	const issuer = teamUrl.origin;
-	const certsUrl = teamUrl.pathname.endsWith(certsPath)
-		? teamUrl
-		: new URL(certsPath, issuer);
-
-	return { issuer, certsUrl };
-}
-
-function logAccessFailure(details: Record<string, unknown>) {
-	console.error("Cloudflare Access JWT validation failed", details);
-}
-
-// Main app that wraps the API and adds React Router fallback
+// Main app — authentication is handled by requireAuth middleware on API routes
 const app = new Hono<{ Bindings: Env }>();
 
-// Cloudflare Access JWT validation middleware (production only)
-app.use("*", async (c, next) => {
-	// Skip validation in development
-	if (import.meta.env.DEV) {
-		return next();
+// GitHub OAuth routes (public)
+app.get("/api/auth/github/login", handleGitHubLogin);
+app.get("/api/auth/github/callback", handleGitHubCallback);
+
+// Current user info
+app.get("/api/auth/me", optionalAuth, (c) => {
+	const user = c.var.user;
+	if (!user) return c.json({ error: "Not authenticated" }, 401);
+	return c.json(user);
+});
+
+// Logout
+app.post("/api/auth/logout", optionalAuth, async (c) => {
+	const token = getCookie(c, "session");
+	if (token) {
+		try {
+			const payload = JSON.parse(atob(token));
+			if (payload.sessionId) {
+				await c.env.D1.prepare("DELETE FROM sessions WHERE id = ?").bind(payload.sessionId as string).run();
+			}
+		} catch { /* ignore invalid tokens */ }
 	}
-
-	const { POLICY_AUD, TEAM_DOMAIN } = c.env;
-
-	// Fail closed in production if Access is not configured.
-	if (!POLICY_AUD || !TEAM_DOMAIN) {
-		return c.text(
-			"Cloudflare Access must be configured in production. Set POLICY_AUD and TEAM_DOMAIN.",
-			500,
-		);
-	}
-
-	const token = c.req.header("cf-access-jwt-assertion");
-	if (!token) {
-		logAccessFailure({ reason: "missing-token" });
-		return c.text("Missing required CF Access JWT", 403);
-	}
-
-	let decodedClaims: Record<string, unknown> | undefined;
-	let decodedHeader: Record<string, unknown> | undefined;
-	try {
-		decodedClaims = decodeJwt(token);
-		decodedHeader = decodeProtectedHeader(token);
-	} catch (error) {
-		logAccessFailure({
-			reason: "malformed-token",
-			message: error instanceof Error ? error.message : String(error),
-		});
-		return c.text("Invalid or expired Access token", 403);
-	}
-
-	try {
-		const { issuer, certsUrl } = getAccessUrls(TEAM_DOMAIN);
-		const JWKS = createRemoteJWKSet(certsUrl);
-		await jwtVerify(token, JWKS, {
-			issuer,
-			audience: POLICY_AUD,
-			clockTolerance: 60,
-		});
-	} catch (error) {
-		const { issuer, certsUrl } = getAccessUrls(TEAM_DOMAIN);
-		logAccessFailure({
-			reason: error instanceof Error ? error.name : "verification-error",
-			message: error instanceof Error ? error.message : String(error),
-			code: error && typeof error === "object" && "code" in error ? (error as { code?: string }).code : undefined,
-			issuer,
-			certsUrl: certsUrl.toString(),
-			policyAud: POLICY_AUD,
-			tokenHeader: decodedHeader,
-			tokenClaims: {
-				iss: decodedClaims.iss,
-				aud: decodedClaims.aud,
-				exp: decodedClaims.exp,
-				nbf: decodedClaims.nbf,
-				iat: decodedClaims.iat,
-			},
-		});
-		return c.text("Invalid or expired Access token", 403);
-	}
-
-	// Authorization model note: once a teammate passes the shared Cloudflare
-	// Access policy, they can access all mailboxes in this app by design.
-	return next();
+	setCookie(c, "session", "", { httpOnly: true, secure: true, sameSite: "Lax", maxAge: 0, path: "/" });
+	return c.json({ status: "logged_out" });
 });
 
 // MCP server endpoint — used by AI coding tools (ProtoAgent, Claude Code, Cursor, etc.)

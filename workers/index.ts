@@ -19,9 +19,11 @@ import { SendEmailRequestSchema } from "./lib/schemas";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
-import { requireMailbox, type MailboxContext } from "./lib/mailbox";
+import { requireMailbox, requireMailboxOwnership, type MailboxContext } from "./lib/mailbox";
+import { requireAuth, requireAdmin, optionalAuth, type AuthContext } from "./auth";
 
 type AppContext = Context<MailboxContext>;
+type AuthAppContext = Context<AuthContext & MailboxContext>;
 
 // -- Request body schemas (kept for validation) ---------------------
 
@@ -149,25 +151,88 @@ app.use("/api/*", cors({
 		return undefined;
 	},
 }));
-app.use("/api/v1/mailboxes/:mailboxId/*", requireMailbox);
+app.use("/api/v1/mailboxes/:mailboxId", requireAuth, requireMailboxOwnership);
+app.use("/api/v1/mailboxes/:mailboxId/*", requireAuth, requireMailboxOwnership, requireMailbox);
 
 // -- Config ---------------------------------------------------------
 
-app.get("/api/v1/config", (c) => {
+app.get("/api/v1/config", optionalAuth, (c) => {
 	const domainsRaw = c.env.DOMAINS || "";
 	const domains = normalizeEmailAddresses(domainsRaw);
 	const emailAddresses = normalizeEmailAddresses(c.env.EMAIL_ADDRESSES);
 	return c.json({ domains, emailAddresses });
 });
 
-// -- Mailboxes ------------------------------------------------------
+// -- User Email Management ------------------------------------------
 
-app.get("/api/v1/mailboxes", async (c) => {
-	const allMailboxes = await listMailboxes(c.env.BUCKET);
-	return c.json(allMailboxes.map((m) => ({ ...m, name: m.id })));
+interface UserEmailRow {
+	id: number;
+	user_id: number;
+	prefix: string;
+	domain: string;
+	full_email: string;
+	is_active: number;
+	created_at: string;
+}
+
+app.get("/api/v1/user/emails", requireAuth, async (c: Context<AuthContext>) => {
+	const user = c.var.user;
+	const rows = await c.env.D1.prepare(
+		"SELECT id, prefix, domain, full_email, is_active, created_at FROM user_emails WHERE user_id = ? ORDER BY created_at DESC"
+	).bind(user.id).all<UserEmailRow>();
+	return c.json(rows.results);
 });
 
-app.post("/api/v1/mailboxes", async (c) => {
+app.post("/api/v1/user/emails", requireAuth, async (c: Context<AuthContext>) => {
+	const user = c.var.user;
+	const { prefix } = await c.req.json<{ prefix: string }>();
+	if (!prefix || !/^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$/.test(prefix) || prefix.length < 2 || prefix.length > 32) {
+		return c.json({ error: "Invalid prefix: 2-32 chars, lowercase alphanumeric with hyphens" }, 400);
+	}
+	const domain = (() => {
+		const raw = c.env.DOMAINS;
+		if (!raw) return "h2seo4.win";
+		if (Array.isArray(raw)) return raw[0];
+		return raw.split(",")[0].trim();
+	})();
+	const fullEmail = `${prefix}@${domain}`;
+	const existing = await c.env.D1.prepare("SELECT id FROM user_emails WHERE full_email = ?").bind(fullEmail).first();
+	if (existing) return c.json({ error: "Email prefix already taken" }, 409);
+	const count = await c.env.D1.prepare("SELECT COUNT(*) as cnt FROM user_emails WHERE user_id = ?").bind(user.id).first<{ cnt: number }>();
+	if (count && count.cnt >= 5) return c.json({ error: "Maximum 5 email addresses per user" }, 403);
+	const result = await c.env.D1.prepare(
+		"INSERT INTO user_emails (user_id, prefix, domain) VALUES (?, ?, ?) RETURNING id, prefix, domain, full_email, is_active, created_at"
+	).bind(user.id, prefix, domain).first<UserEmailRow>();
+	if (result) await ensureMailboxExists(c.env, result.full_email, prefix);
+	return c.json(result, 201);
+});
+
+app.delete("/api/v1/user/emails/:id", requireAuth, async (c: Context<AuthContext>) => {
+	const user = c.var.user;
+	const id = Number(c.req.param("id")!);
+	if (Number.isNaN(id)) return c.json({ error: "Invalid id" }, 400);
+	const email = await c.env.D1.prepare("SELECT * FROM user_emails WHERE id = ? AND user_id = ?").bind(id, user.id).first();
+	if (!email) return c.json({ error: "Email not found or not yours" }, 404);
+	await c.env.D1.prepare("DELETE FROM user_emails WHERE id = ?").bind(id).run();
+	return c.body(null, 204);
+});
+
+// -- Mailboxes ------------------------------------------------------
+
+app.get("/api/v1/mailboxes", requireAuth, async (c: Context<AuthContext>) => {
+	const user = c.var.user;
+	const userEmailRows = await c.env.D1.prepare(
+		"SELECT full_email FROM user_emails WHERE user_id = ? AND is_active = 1"
+	).bind(user.id).all<{ full_email: string }>();
+	const userEmails = new Set(userEmailRows.results.map(r => r.full_email.toLowerCase()));
+	const allMailboxes = await listMailboxes(c.env.BUCKET);
+	return c.json(allMailboxes
+		.filter((m) => import.meta.env.DEV || userEmails.has(m.email.toLowerCase()))
+		.map((m) => ({ ...m, name: m.id })));
+});
+
+app.post("/api/v1/mailboxes", requireAuth, async (c: Context<AuthContext>) => {
+	const user = c.var.user;
 	const { name, settings, email: rawEmail } = CreateMailboxBody.parse(await c.req.json());
 	const email = rawEmail.toLowerCase();
 	const allowedAddresses = normalizeEmailAddresses(c.env.EMAIL_ADDRESSES);
@@ -180,6 +245,13 @@ app.post("/api/v1/mailboxes", async (c) => {
 	await c.env.BUCKET.put(key, JSON.stringify(finalSettings));
 	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(email));
 	await stub.getFolders();
+	// Sync to D1 user_emails so the mailbox appears in user's list
+	const existing = await c.env.D1.prepare("SELECT id FROM user_emails WHERE full_email = ?").bind(email).first();
+	if (!existing) {
+		const [prefix, domain] = email.split("@");
+		await c.env.D1.prepare("INSERT OR IGNORE INTO user_emails (user_id, prefix, domain) VALUES (?, ?, ?)")
+			.bind(user.id, prefix || email, domain || "h2seo4.win").run();
+	}
 	return c.json({ id: email, email, name, settings: finalSettings }, 201);
 });
 
@@ -232,10 +304,18 @@ app.get("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 	return c.json(emails);
 });
 
-app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
+app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AuthAppContext) => {
+	const user = c.var.user;
 	const mailboxId = c.req.param("mailboxId")!;
 	const body = SendEmailRequestSchema.parse(await c.req.json());
 	const { to, cc, bcc, from, subject, html, text, attachments, in_reply_to, references, thread_id } = body;
+
+	if (!import.meta.env.DEV) {
+		const owned = await c.env.D1.prepare(
+			"SELECT id FROM user_emails WHERE full_email = ? AND user_id = ? AND is_active = 1"
+		).bind(mailboxId.toLowerCase(), user.id).first();
+		if (!owned) return c.json({ error: "You do not own this email address" }, 403);
+	}
 
 	let toStr: string, fromEmail: string, fromDomain: string;
 	try {
@@ -266,14 +346,21 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 			{ key: "subject", value: subject }, { key: "date", value: new Date().toISOString() },
 			{ key: "message-id", value: `<${outgoingMessageId}>` },
 		]),
+		user_id: user.id,
 	}, attachmentData);
 
+	const fromStr: { email: string; name: string } = typeof from === "string"
+		? { email: from, name: "" }
+		: from;
+
 	c.executionCtx.waitUntil(
-		sendEmail(c.env.EMAIL, {
-			to, cc, bcc, from, subject, html, text,
+		sendEmail(c.env.RESEND_API_KEY, {
+			to, cc, bcc,
+			from: fromStr.name ? fromStr : from,
+			subject, html, text,
 			attachments: attachments?.map((att) => ({ content: att.content, filename: att.filename, type: att.type, disposition: att.disposition || "attachment", contentId: att.contentId })),
 			...(in_reply_to ? { headers: buildThreadingHeaders(in_reply_to, references || []) } : {}),
-		}).catch((e) => console.error("Deferred email delivery failed:", (e as Error).message)),
+		}).catch((e) => console.error("Resend delivery failed:", (e as Error).message)),
 	);
 	return c.json({ id: messageId, status: "sent" }, 202);
 });
@@ -418,18 +505,30 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 
 	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) throw new Error("received email with empty to");
 
-	const allowedAddresses = normalizeEmailAddresses(env.EMAIL_ADDRESSES).map((a) => a.toLowerCase());
 	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
 	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 
-	let mailboxId: string | undefined;
-	if (allowedAddresses.length > 0) {
-		mailboxId = allRecipients.find((addr) => allowedAddresses.includes(addr));
-		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return; }
-	} else { mailboxId = allRecipients[0]; }
-	if (!mailboxId) throw new Error("received email with no valid recipient address");
+	// Check D1 user_emails table — only accept emails for registered user prefixes
+	let matchedEmail: string | null = null;
+	let matchedUserId: number | null = null;
+	for (const recipient of allRecipients) {
+		const row = await env.D1.prepare(
+			"SELECT ue.full_email, ue.user_id FROM user_emails ue WHERE ue.full_email = ? AND ue.is_active = 1"
+		).bind(recipient).first<{ full_email: string; user_id: number }>();
+		if (row) {
+			matchedEmail = row.full_email;
+			matchedUserId = row.user_id;
+			break;
+		}
+	}
 
+	if (!matchedEmail || matchedUserId === null) {
+		console.log(`Ignoring email: no registered user for [${allRecipients.join(", ")}]`);
+		return;
+	}
+
+	const mailboxId = matchedEmail;
 	const messageId = crypto.randomUUID();
 	const mailboxCreated = await ensureMailboxExists(env, mailboxId);
 	if (mailboxCreated) {
@@ -466,10 +565,11 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 		id: messageId, subject: parsedEmail.subject || "",
 		sender: (parsedEmail.from?.address || "").toLowerCase(), recipient: allRecipients.join(", "),
 		cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
-		date: new Date().toISOString(), // uses receive time, not the email's Date header
+		date: new Date().toISOString(),
 		body: parsedEmail.html || parsedEmail.text || "",
 		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
 		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
+		user_id: matchedUserId,
 	}, attachmentData);
 
 	const agentStub = env.EMAIL_AGENT.get(env.EMAIL_AGENT.idFromName(mailboxId));
@@ -478,5 +578,45 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 		body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId }),
 	})).catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)));
 }
+
+// -- Admin Routes ----------------------------------------------------
+
+interface AdminUserRow {
+	id: number;
+	github_id: number;
+	github_login: string;
+	github_avatar: string | null;
+	display_name: string | null;
+	created_at: string;
+	email_count: number;
+	emails: string;
+}
+
+app.get("/api/admin/users", requireAuth, requireAdmin, async (c: Context<AuthContext>) => {
+	const rows = await c.env.D1.prepare(`
+		SELECT
+			u.id, u.github_id, u.github_login, u.github_avatar, u.display_name, u.created_at,
+			COUNT(ue.id) as email_count,
+			COALESCE(GROUP_CONCAT(ue.full_email, ', '), '') as emails
+		FROM users u
+		LEFT JOIN user_emails ue ON ue.user_id = u.id
+		GROUP BY u.id
+		ORDER BY u.created_at DESC
+	`).all<AdminUserRow>();
+	const totalUsers = rows.results.length;
+	const totalEmails = rows.results.reduce((sum, r) => sum + r.email_count, 0);
+	return c.json({ users: rows.results, totalUsers, totalEmails });
+});
+
+app.get("/api/admin/stats", requireAuth, requireAdmin, async (c: Context<AuthContext>) => {
+	const userCount = await c.env.D1.prepare("SELECT COUNT(*) as cnt FROM users").first<{ cnt: number }>();
+	const emailCount = await c.env.D1.prepare("SELECT COUNT(*) as cnt FROM user_emails").first<{ cnt: number }>();
+	const mailboxCount = (await c.env.BUCKET.list({ prefix: "mailboxes/" })).objects.length;
+	return c.json({
+		totalUsers: userCount?.cnt || 0,
+		totalEmails: emailCount?.cnt || 0,
+		totalMailboxes: mailboxCount,
+	});
+});
 
 export { app, receiveEmail };

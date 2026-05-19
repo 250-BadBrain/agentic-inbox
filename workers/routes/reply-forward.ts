@@ -88,7 +88,7 @@ export async function handleReplyEmail(c: AppContext) {
 	await stub.markThreadRead(thread_id);
 
 	c.executionCtx.waitUntil(
-		sendEmail(c.env.EMAIL, {
+		sendEmail(c.env.RESEND_API_KEY, {
 			to,
 			cc,
 			bcc,
@@ -105,7 +105,7 @@ export async function handleReplyEmail(c: AppContext) {
 			})),
 			headers: buildThreadingHeaders(originalMsgId, references),
 		}).catch((e) => {
-			console.error("Deferred reply delivery failed:", (e as Error).message);
+			console.error("Resend reply delivery failed:", (e as Error).message);
 		}),
 	);
 
@@ -174,7 +174,7 @@ export async function handleForwardEmail(c: AppContext) {
 	);
 
 	c.executionCtx.waitUntil(
-		sendEmail(c.env.EMAIL, {
+		sendEmail(c.env.RESEND_API_KEY, {
 			to,
 			cc,
 			bcc,
@@ -190,7 +190,7 @@ export async function handleForwardEmail(c: AppContext) {
 				contentId: att.contentId,
 			})),
 		}).catch((e) => {
-			console.error("Deferred forward delivery failed:", (e as Error).message);
+			console.error("Resend forward delivery failed:", (e as Error).message);
 		}),
 	);
 

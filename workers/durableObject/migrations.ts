@@ -83,6 +83,14 @@ function txn(sql: string): string {
 
 export const mailboxMigrations: Migration[] = [
 	{
+		name: "9_add_user_id_to_emails",
+		sql: txn(`
+			ALTER TABLE emails ADD COLUMN user_id INTEGER;
+			CREATE INDEX IF NOT EXISTS idx_emails_user_id ON emails(user_id);
+		`),
+	},
+
+	{
 		name: "1_initial_setup",
 		sql: txn(`
             CREATE TABLE folders (

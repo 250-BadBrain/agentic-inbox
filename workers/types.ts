@@ -17,4 +17,10 @@ export interface Env extends Cloudflare.Env {
 	EMAIL_MCP: DurableObjectNamespace<EmailMCP>;
 	POLICY_AUD: string;
 	TEAM_DOMAIN: string;
+	D1: D1Database;
+	GITHUB_CLIENT_ID: string;
+	GITHUB_CLIENT_SECRET: string;
+	RESEND_API_KEY: string;
+	APP_URL: string;
+	JWT_SECRET: string;
 }

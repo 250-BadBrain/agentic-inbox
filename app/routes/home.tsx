@@ -12,7 +12,7 @@ import {
 	Text,
 	useKumoToastManager,
 } from "@cloudflare/kumo";
-import { EnvelopeIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react";
+import { EnvelopeIcon, PlusIcon, SignOut, TrashIcon } from "@phosphor-icons/react";
 import { useQuery } from "@tanstack/react-query";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 import { Link as RouterLink } from "react-router";
@@ -37,11 +37,14 @@ export default function HomeRoute() {
 	const { data: configData } = useQuery({
 		queryKey: queryKeys.config,
 		queryFn: () => api.getConfig(),
-		staleTime: Infinity, // config rarely changes
+		staleTime: Infinity,
 	});
 
-	const domains = configData?.domains ?? [];
-	const emailAddresses = configData?.emailAddresses ?? [];
+	const [authChecked, setAuthChecked] = useState(false);
+	const [isLoggedIn, setIsLoggedIn] = useState(false);
+	useEffect(() => {
+		api.getMe().then(() => setIsLoggedIn(true)).catch(() => setIsLoggedIn(false)).finally(() => setAuthChecked(true));
+	}, []);
 
 	const [isCreateOpen, setIsCreateOpen] = useState(false);
 	const [newPrefix, setNewPrefix] = useState("");
@@ -56,6 +59,18 @@ export default function HomeRoute() {
 	} | null>(null);
 	const [isDeleting, setIsDeleting] = useState(false);
 
+	const domains = configData?.domains ?? [];
+	const emailAddresses = configData?.emailAddresses ?? [];
+
+	const [isLoggingOut, setIsLoggingOut] = useState(false);
+	const handleLogout = async () => {
+		setIsLoggingOut(true);
+		try {
+			await api.logout();
+		} catch {}
+		window.location.reload();
+	};
+
 	// Set default domain when config loads
 	useEffect(() => {
 		if (domains.length > 0 && !selectedDomain) {
@@ -63,7 +78,7 @@ export default function HomeRoute() {
 		}
 	}, [domains, selectedDomain]);
 
-	// Auto-create mailboxes from config (run once when both data sources are ready)
+	// Auto-create mailboxes from config
 	const autoCreateDone = useRef(false);
 	useEffect(() => {
 		if (autoCreateDone.current) return;
@@ -88,6 +103,35 @@ export default function HomeRoute() {
 		).then(() => { if (!cancelled) refetchMailboxes(); });
 		return () => { cancelled = true; };
 	}, [emailAddresses, mailboxes, refetchMailboxes]);
+
+	if (!authChecked) {
+		return (
+			<div className="flex items-center justify-center min-h-screen bg-kumo-recessed">
+				<Loader size="lg" />
+			</div>
+		);
+	}
+
+	if (!isLoggedIn) {
+		return (
+			<div className="min-h-screen bg-kumo-recessed flex items-center justify-center">
+				<div className="text-center max-w-md px-6">
+					<div className="mb-6">
+						<EnvelopeIcon size={64} weight="thin" className="text-kumo-subtle mx-auto" />
+					</div>
+					<h1 className="text-2xl font-bold text-kumo-default mb-2">Agentic Inbox</h1>
+					<p className="text-sm text-kumo-subtle mb-8">Sign in with GitHub to manage your email inboxes</p>
+					<div className="flex justify-center">
+						<a href="/api/auth/github/login">
+							<Button variant="primary" size="lg">
+								Sign in with GitHub
+							</Button>
+						</a>
+					</div>
+				</div>
+			</div>
+		);
+	}
 
 	const handleCreate = async (e: FormEvent) => {
 		e.preventDefault();
@@ -145,15 +189,28 @@ export default function HomeRoute() {
 				<div className="mb-8">
 					<div className="flex items-center justify-between">
 						<h1 className="text-2xl font-bold text-kumo-default">Mailboxes</h1>
-						{!isConfigured && (
-							<Button
-								variant="primary"
-								icon={<PlusIcon size={16} />}
-								onClick={() => setIsCreateOpen(true)}
+						<div className="flex items-center gap-2">
+							<RouterLink to="/admin" className="text-xs text-kumo-subtle hover:text-kumo-default no-underline transition-colors">
+								Admin
+							</RouterLink>
+							<button
+								onClick={handleLogout}
+								disabled={isLoggingOut}
+								className="flex items-center gap-1 text-xs text-kumo-subtle hover:text-kumo-default no-underline transition-colors bg-transparent border-none cursor-pointer"
 							>
-								New Mailbox
-							</Button>
-						)}
+								<SignOut size={12} />
+								{isLoggingOut ? "Logging out..." : "Logout"}
+							</button>
+							{!isConfigured && (
+								<Button
+									variant="primary"
+									icon={<PlusIcon size={16} />}
+									onClick={() => setIsCreateOpen(true)}
+								>
+									New Mailbox
+								</Button>
+							)}
+						</div>
 					</div>
 					{domains.length > 0 && (
 						<p className="text-sm text-kumo-subtle mt-1">

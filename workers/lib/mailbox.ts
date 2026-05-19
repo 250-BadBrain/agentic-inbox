@@ -1,12 +1,3 @@
-// Copyright (c) 2026 Cloudflare, Inc.
-// Licensed under the Apache 2.0 license found in the LICENSE file or at:
-//     https://opensource.org/licenses/Apache-2.0
-
-/**
- * Hono middleware to handle repetitive Mailbox Durable Object instantiation.
- * Checks if the mailbox exists in R2, then instantiates the DO stub
- * and attaches it to the Hono context (`c.var.mailboxStub`).
- */
 import { createMiddleware } from "hono/factory";
 import type { MailboxDO } from "../durableObject";
 import type { Env } from "../types";
@@ -23,19 +14,38 @@ export const requireMailbox = createMiddleware<MailboxContext>(async (c, next) =
 	if (!rawId) return c.json({ error: "Mailbox ID required" }, 400);
 	const mailboxId = decodeURIComponent(rawId);
 
-	// Verify mailbox exists
 	const key = `mailboxes/${mailboxId}.json`;
 	const obj = await c.env.BUCKET.head(key);
 	if (!obj) {
 		return c.json({ error: "Not found" }, 404);
 	}
 
-	// Instantiate DO stub
 	const ns = c.env.MAILBOX;
 	const id = ns.idFromName(mailboxId);
 	const stub = ns.get(id);
 
 	c.set("mailboxStub", stub);
-	
+
+	await next();
+});
+
+export const requireMailboxOwnership = createMiddleware<{
+	Bindings: Env;
+	Variables: {
+		user: { id: number };
+	};
+}>(async (c, next) => {
+	const rawId = c.req.param("mailboxId");
+	if (!rawId) return c.json({ error: "Mailbox ID required" }, 400);
+	const mailboxId = decodeURIComponent(rawId);
+	const user = c.var.user;
+
+	if (import.meta.env.DEV) return next();
+
+	const owned = await c.env.D1.prepare(
+		"SELECT id FROM user_emails WHERE full_email = ? AND user_id = ? AND is_active = 1"
+	).bind(mailboxId.toLowerCase(), user.id).first();
+	if (!owned) return c.json({ error: "Mailbox not found or access denied" }, 404);
+
 	await next();
 });

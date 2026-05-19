@@ -160,6 +160,28 @@ const api = {
 	// Search
 	searchEmails: (mailboxId: string, params: Record<string, string>) =>
 		get<EmailListResponse | Email[]>(`/api/v1/mailboxes/${mailboxId}/search`, { params }),
+
+	// Auth
+	getMe: () => get<{ id: number; github_login: string; github_avatar: string | null; display_name: string | null }>("/api/auth/me"),
+	logout: () => post<void>("/api/auth/logout"),
+
+	// User Email Management
+	getUserEmails: () => get<UserEmail[]>("/api/v1/user/emails"),
+	createUserEmail: (prefix: string) => post<UserEmail>("/api/v1/user/emails", { prefix }),
+	deleteUserEmail: (id: number) => del<void>(`/api/v1/user/emails/${id}`),
 };
 
+interface UserEmail {
+	id: number;
+	prefix: string;
+	domain: string;
+	full_email: string;
+	is_active: number;
+	created_at: string;
+}
+
+export type { UserEmail };
 export default api;
+
+// Re-export request helpers for admin/etc.
+export { get, post, del };
